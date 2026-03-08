@@ -8,21 +8,32 @@ Built for the human-in-the-loop workflow: Claude writes a plan, you review it in
 
 ## Install
 
-```bash
-go install github.com/kevindutra/crit/cmd/crit@latest
-```
+### Claude Code Plugin Marketplace (recommended)
 
-## Claude Code Integration
-
-### Plugin (recommended)
+crit is available as a Claude Code plugin. Add the marketplace and install:
 
 ```
+/plugin marketplace add kevindutra/crit
 /plugin install crit
 ```
 
 Then use `/crit:review <path>` to open the TUI. After you close it, Claude reads your comments and edits the document to address them.
 
+### From source
+
+```bash
+go install github.com/kevindutra/crit/cmd/crit@latest
+```
+
+Make sure `$GOPATH/bin` (defaults to `~/go/bin`) is in your `PATH`:
+
+```bash
+export PATH="$PATH:$(go env GOPATH)/bin"
+```
+
 ### Manual skill install
+
+If you prefer not to use the plugin, you can install the skill directly:
 
 ```bash
 crit setup-claude          # Install globally (~/.claude/skills/)
