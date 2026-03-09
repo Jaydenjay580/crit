@@ -1,6 +1,24 @@
 package tui
 
-import "charm.land/lipgloss/v2"
+import (
+	"fmt"
+	"image/color"
+
+	"charm.land/lipgloss/v2"
+)
+
+func tabBorderWithBottom(left, middle, right string) lipgloss.Border {
+	border := lipgloss.RoundedBorder()
+	border.BottomLeft = left
+	border.Bottom = middle
+	border.BottomRight = right
+	return border
+}
+
+var (
+	activeTabBorder   = tabBorderWithBottom("┘", " ", "└")
+	inactiveTabBorder = tabBorderWithBottom("┴", "─", "┴")
+)
 
 // ANSI 16 named colors — these adapt to the user's terminal color scheme.
 var (
@@ -210,6 +228,42 @@ var (
 				Bold(true).
 				Padding(0, 1)
 
+	// Tab bar styles — bordered tabs with open-bottom active tab
+	inactiveTabStyle = lipgloss.NewStyle().
+				Border(inactiveTabBorder, true).
+				BorderForeground(accent).
+				Foreground(muted).
+				Padding(0, 1)
+
+	activeTabStyle = lipgloss.NewStyle().
+			Border(activeTabBorder, true).
+			BorderForeground(accent).
+			Bold(true).
+			Foreground(lipgloss.BrightWhite).
+			Padding(0, 1)
+
+	tabSearchPromptStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(warning)
+
+	// Diff gutter markers
+	diffAddedGutter = lipgloss.NewStyle().
+			Foreground(lipgloss.Green).
+			Bold(true)
+
+	diffDeletedGutter = lipgloss.NewStyle().
+				Foreground(lipgloss.Red).
+				Bold(true)
+
+	diffDeletedLineNum = lipgloss.NewStyle().
+				Foreground(lipgloss.Red).
+				Width(5).
+				Align(lipgloss.Right)
+
+	// Change count in tab labels
+	tabChangeCount = lipgloss.NewStyle().
+			Foreground(lipgloss.Green)
+
 	// Context box in comment/edit modals
 	contextBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -223,6 +277,9 @@ var (
 
 	sidebarHighlightBg = lipgloss.NewStyle().
 				Reverse(true)
+
+	diffChangedLineBg = lipgloss.NewStyle()
+	diffDeletedLineBg = lipgloss.NewStyle()
 
 	visualModeIndicator = lipgloss.NewStyle().
 				Bold(true).
@@ -251,4 +308,24 @@ func initAdaptiveStyles(hasDarkBG bool) {
 	mdCodeStyle = lipgloss.NewStyle().
 		Foreground(lipgloss.BrightYellow).
 		Background(ld(lipgloss.Color("#E8E8E8"), lipgloss.Color("#3a3a3a")))
+
+	diffChangedLineBg = lipgloss.NewStyle().
+		Background(ld(lipgloss.Color("#D8F0D8"), lipgloss.Color("#1A3A1A")))
+
+	diffDeletedLineBg = lipgloss.NewStyle().
+		Background(ld(lipgloss.Color("#F0D8D8"), lipgloss.Color("#3A1A1A")))
+}
+
+// bgToAnsi converts a lipgloss color to a raw ANSI truecolor background escape sequence.
+// Returns "" if the color is nil or zero-alpha.
+func bgToAnsi(c color.Color) string {
+	if c == nil {
+		return ""
+	}
+	r, g, b, a := c.RGBA()
+	if a == 0 {
+		return ""
+	}
+	// RGBA() returns 16-bit values; scale to 8-bit.
+	return fmt.Sprintf("\033[48;2;%d;%d;%dm", r>>8, g>>8, b>>8)
 }

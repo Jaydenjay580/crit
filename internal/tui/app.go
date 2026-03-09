@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kevindutra/crit/internal/document"
+	gitpkg "github.com/kevindutra/crit/internal/git"
 	"github.com/kevindutra/crit/internal/review"
 )
 
@@ -42,30 +44,22 @@ type AppModel struct {
 	focused       pane
 	modal         modalType
 
+	// Multi-file tabs (code review mode)
+	tabs         []FileTab
+	activeTab    int
+	multiFile    bool // true when in code review mode
+	tabSearching bool
+	tabSearch    string
+	tabMatches   []int // indices of matching tabs during search
+
+	// Single-file mode (legacy)
 	filePath string
-	doc      *document.Document
-	state    *review.ReviewState
+
 	detached bool
 
 	contentViewport viewport.Model
 	commentViewport viewport.Model
 	modalTextarea   textarea.Model
-
-	cursorLine int // 1-based
-
-	// Visual selection mode (like vim's V)
-	selecting    bool
-	selectAnchor int // the line where selection started
-
-	// Sidebar annotation list and cursor
-	sidebarItems  []sidebarItem
-	sidebarCursor int
-
-	// Content pane annotation focus: when moving through lines, cursor can
-	// land on annotation boxes between lines. cursorOnAnnotation means the
-	// cursor is on an annotation box after cursorLine, at index cursorAnnoIdx.
-	cursorOnAnnotation bool
-	cursorAnnoIdx      int
 
 	// Editing state
 	editingID  string // ID of the comment being edited
@@ -74,31 +68,87 @@ type AppModel struct {
 	err error
 }
 
+// tab returns the active FileTab. Panics if no tabs exist.
+func (m *AppModel) tab() *FileTab {
+	return &m.tabs[m.activeTab]
+}
+
 func NewApp(filePath string) AppModel {
 	ta := textarea.New()
 	ta.Placeholder = "Type your comment..."
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 2000
 
+	tab := FileTab{
+		path:       filePath,
+		cursorLine: 1,
+	}
+
 	return AppModel{
 		filePath:        filePath,
+		tabs:            []FileTab{tab},
+		activeTab:       0,
 		detached:        os.Getenv("CRIT_DETACHED") == "1",
 		contentViewport: viewport.New(),
 		commentViewport: viewport.New(),
 		modalTextarea:   ta,
-		cursorLine:      1,
+	}
+}
+
+// NewCodeReviewApp creates a multi-file code review TUI.
+func NewCodeReviewApp(files []gitpkg.FileChange, ref string) AppModel {
+	ta := textarea.New()
+	ta.Placeholder = "Type your comment..."
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 2000
+
+	// Sort files alphabetically by path
+	sortedFiles := make([]gitpkg.FileChange, len(files))
+	copy(sortedFiles, files)
+	sort.Slice(sortedFiles, func(i, j int) bool {
+		return sortedFiles[i].Path < sortedFiles[j].Path
+	})
+
+	tabs := make([]FileTab, 0, len(sortedFiles))
+	for _, f := range sortedFiles {
+		var diff *gitpkg.DiffInfo
+		if f.Status != gitpkg.StatusDeleted && f.Status != gitpkg.StatusBinary {
+			diff, _ = gitpkg.DiffFile(f.Path, ref)
+		}
+		ft := newFileTab(f.Path, diff)
+		if f.Status == gitpkg.StatusBinary {
+			ft.isBinary = true
+		}
+		if f.Status == gitpkg.StatusDeleted {
+			ft.isDeleted = true
+		}
+		tabs = append(tabs, ft)
+	}
+
+	return AppModel{
+		tabs:            tabs,
+		activeTab:       0,
+		multiFile:       true,
+		detached:        os.Getenv("CRIT_DETACHED") == "1",
+		contentViewport: viewport.New(),
+		commentViewport: viewport.New(),
+		modalTextarea:   ta,
 	}
 }
 
 func (m AppModel) Init() tea.Cmd {
-	return tea.Batch(m.loadDocument(), tea.RequestBackgroundColor)
+	return tea.Batch(m.loadDocuments(), tea.RequestBackgroundColor)
 }
 
-func (m AppModel) loadDocument() tea.Cmd {
+func (m AppModel) loadDocuments() tea.Cmd {
 	return func() tea.Msg {
-		_, err := document.Load(m.filePath)
-		if err != nil {
-			return errMsg{err}
+		for _, tab := range m.tabs {
+			if tab.isBinary || tab.isDeleted {
+				continue
+			}
+			if _, err := document.Load(tab.path); err != nil {
+				return errMsg{err}
+			}
 		}
 		return docRenderedMsg{}
 	}
@@ -107,10 +157,11 @@ func (m AppModel) loadDocument() tea.Cmd {
 // selectionRange returns the ordered start/end of the current selection.
 // If not selecting, returns cursorLine, cursorLine.
 func (m *AppModel) selectionRange() (int, int) {
-	if !m.selecting {
-		return m.cursorLine, m.cursorLine
+	t := m.tab()
+	if !t.selecting {
+		return t.cursorLine, t.cursorLine
 	}
-	start, end := m.selectAnchor, m.cursorLine
+	start, end := t.selectAnchor, t.cursorLine
 	if start > end {
 		start, end = end, start
 	}
@@ -121,7 +172,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.BackgroundColorMsg:
 		initAdaptiveStyles(msg.IsDark())
-		if m.state != nil {
+		if len(m.tabs) > 0 && m.tab().state != nil {
 			m.rebuildContent()
 		}
 		return m, nil
@@ -130,22 +181,30 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.recalculateLayout()
-		if m.state != nil {
+		if len(m.tabs) > 0 && m.tab().state != nil {
 			m.rebuildContent()
 		}
 		return m, nil
 
 	case docRenderedMsg:
-		// Start each review session fresh — discard any stale comments
-		// from prior sessions so Claude only sees current feedback.
-		state := &review.ReviewState{
-			File:     m.filePath,
-			Comments: []review.Comment{},
+		// Load documents and initialize fresh review state for each tab
+		for i := range m.tabs {
+			t := &m.tabs[i]
+			if t.isBinary || t.isDeleted {
+				t.state = &review.ReviewState{
+					File:     t.path,
+					Comments: []review.Comment{},
+				}
+				continue
+			}
+			doc, _ := document.Load(t.path)
+			t.doc = doc
+			t.state = &review.ReviewState{
+				File:     t.path,
+				Comments: []review.Comment{},
+			}
+			t.ensureHighlightCache()
 		}
-
-		doc, _ := document.Load(m.filePath)
-		m.doc = doc
-		m.state = state
 
 		m.rebuildContent()
 		m.updateCommentSidebar()
@@ -180,25 +239,34 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleTextModal(msg)
 	}
 
+	// Tab search input mode
+	if m.tabSearching {
+		return m.handleTabSearch(msg)
+	}
+
+	t := m.tab()
+
 	switch {
 	case key.Matches(msg, keys.Quit):
-		// Auto-save on quit
-		if m.state != nil {
-			review.Save(m.state)
+		// Auto-save all tabs on quit
+		for i := range m.tabs {
+			if m.tabs[i].state != nil {
+				review.Save(m.tabs[i].state)
+			}
 		}
 		return m, tea.Quit
 
 	case key.Matches(msg, keys.Cancel):
 		// Esc cancels selection
-		if m.selecting {
-			m.selecting = false
+		if t.selecting {
+			t.selecting = false
 			m.rebuildContent()
 			return m, nil
 		}
 		return m, nil
 
 	case key.Matches(msg, keys.Tab):
-		if !m.selecting {
+		if !t.selecting {
 			if m.focused == contentPane {
 				m.focused = commentPane
 			} else {
@@ -210,114 +278,149 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, keys.VisualMode):
-		if m.focused == contentPane && m.doc != nil {
-			if m.selecting {
-				m.selecting = false
+		if m.focused == contentPane && t.doc != nil {
+			if t.selecting {
+				t.selecting = false
 			} else {
-				m.selecting = true
-				m.selectAnchor = m.cursorLine
+				t.selecting = true
+				t.selectAnchor = t.cursorLine
 			}
 			m.rebuildContent()
 			return m, nil
 		}
 	}
 
+	// Tab switching (multi-file mode)
+	if m.multiFile && m.focused == contentPane && !t.selecting {
+		switch {
+		case key.Matches(msg, keys.PrevTab):
+			if m.activeTab > 0 {
+				m.activeTab--
+				m.rebuildContent()
+				m.updateCommentSidebar()
+			}
+			return m, nil
+		case key.Matches(msg, keys.NextTab):
+			if m.activeTab < len(m.tabs)-1 {
+				m.activeTab++
+				m.rebuildContent()
+				m.updateCommentSidebar()
+			}
+			return m, nil
+		case key.Matches(msg, keys.TabSearch):
+			m.tabSearching = true
+			m.tabSearch = ""
+			m.tabMatches = nil
+			return m, nil
+		}
+		// Number keys 1-9 for direct tab access
+		if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+			idx := int(s[0]-'0') - 1
+			if idx < len(m.tabs) {
+				m.activeTab = idx
+				m.rebuildContent()
+				m.updateCommentSidebar()
+			}
+			return m, nil
+		}
+	}
+
 	// Content pane cursor movement (annotation-aware)
-	if m.focused == contentPane && m.doc != nil {
+	if m.focused == contentPane && t.doc != nil {
 		moved := false
 		switch {
 		case key.Matches(msg, keys.Down):
-			if m.cursorOnAnnotation {
-				anns := m.annotationsAfterLine(m.cursorLine)
-				if m.cursorAnnoIdx < len(anns)-1 {
-					m.cursorAnnoIdx++
+			if t.cursorOnAnnotation {
+				anns := m.annotationsAfterLine(t.cursorLine)
+				if t.cursorAnnoIdx < len(anns)-1 {
+					t.cursorAnnoIdx++
 				} else {
-					m.cursorOnAnnotation = false
-					m.cursorAnnoIdx = 0
-					if m.cursorLine < m.doc.LineCount() {
-						m.cursorLine++
+					t.cursorOnAnnotation = false
+					t.cursorAnnoIdx = 0
+					if t.cursorLine < t.doc.LineCount() {
+						t.cursorLine++
 					}
 				}
 			} else {
-				anns := m.annotationsAfterLine(m.cursorLine)
+				anns := m.annotationsAfterLine(t.cursorLine)
 				if len(anns) > 0 {
-					m.cursorOnAnnotation = true
-					m.cursorAnnoIdx = 0
-				} else if m.cursorLine < m.doc.LineCount() {
-					m.cursorLine++
+					t.cursorOnAnnotation = true
+					t.cursorAnnoIdx = 0
+				} else if t.cursorLine < t.doc.LineCount() {
+					t.cursorLine++
 				}
 			}
 			moved = true
 		case key.Matches(msg, keys.Up):
-			if m.cursorOnAnnotation {
-				if m.cursorAnnoIdx > 0 {
-					m.cursorAnnoIdx--
+			if t.cursorOnAnnotation {
+				if t.cursorAnnoIdx > 0 {
+					t.cursorAnnoIdx--
 				} else {
-					m.cursorOnAnnotation = false
-					m.cursorAnnoIdx = 0
+					t.cursorOnAnnotation = false
+					t.cursorAnnoIdx = 0
 				}
 			} else {
-				prevLine := m.cursorLine - 1
+				prevLine := t.cursorLine - 1
 				if prevLine >= 1 {
 					anns := m.annotationsAfterLine(prevLine)
 					if len(anns) > 0 {
-						m.cursorLine = prevLine
-						m.cursorOnAnnotation = true
-						m.cursorAnnoIdx = len(anns) - 1
+						t.cursorLine = prevLine
+						t.cursorOnAnnotation = true
+						t.cursorAnnoIdx = len(anns) - 1
 					} else {
-						m.cursorLine = prevLine
+						t.cursorLine = prevLine
 					}
 				}
 			}
 			moved = true
 		case key.Matches(msg, keys.HalfPageDown):
-			m.cursorOnAnnotation = false
-			m.cursorAnnoIdx = 0
+			t.cursorOnAnnotation = false
+			t.cursorAnnoIdx = 0
 			jump := m.contentViewport.Height() / 2
-			m.cursorLine += jump
-			if m.cursorLine > m.doc.LineCount() {
-				m.cursorLine = m.doc.LineCount()
+			t.cursorLine += jump
+			if t.cursorLine > t.doc.LineCount() {
+				t.cursorLine = t.doc.LineCount()
 			}
 			moved = true
 		case key.Matches(msg, keys.HalfPageUp):
-			m.cursorOnAnnotation = false
-			m.cursorAnnoIdx = 0
+			t.cursorOnAnnotation = false
+			t.cursorAnnoIdx = 0
 			jump := m.contentViewport.Height() / 2
-			m.cursorLine -= jump
-			if m.cursorLine < 1 {
-				m.cursorLine = 1
+			t.cursorLine -= jump
+			if t.cursorLine < 1 {
+				t.cursorLine = 1
 			}
 			moved = true
 		case key.Matches(msg, keys.Top):
-			m.cursorOnAnnotation = false
-			m.cursorAnnoIdx = 0
-			m.cursorLine = 1
+			t.cursorOnAnnotation = false
+			t.cursorAnnoIdx = 0
+			t.cursorLine = 1
 			moved = true
 		case key.Matches(msg, keys.Bottom):
-			m.cursorOnAnnotation = false
-			m.cursorAnnoIdx = 0
-			m.cursorLine = m.doc.LineCount()
+			t.cursorOnAnnotation = false
+			t.cursorAnnoIdx = 0
+			t.cursorLine = t.doc.LineCount()
 			moved = true
 		case key.Matches(msg, keys.NextComment):
-			if m.state != nil && len(m.state.Comments) > 0 {
+			if t.state != nil && len(t.state.Comments) > 0 {
 				type target struct {
 					endLine int
 					idx     int
 				}
 				var best *target
-				for _, c := range m.state.Comments {
+				for _, c := range t.state.Comments {
 					endAt := c.Line
 					if c.EndLine > 0 {
 						endAt = c.EndLine
 					}
-					if endAt > m.cursorLine || (endAt == m.cursorLine && !m.cursorOnAnnotation) {
+					if endAt > t.cursorLine || (endAt == t.cursorLine && !t.cursorOnAnnotation) {
 						if best == nil || endAt < best.endLine {
 							best = &target{endLine: endAt, idx: 0}
 						}
 					}
 				}
 				if best == nil {
-					for _, c := range m.state.Comments {
+					for _, c := range t.state.Comments {
 						endAt := c.Line
 						if c.EndLine > 0 {
 							endAt = c.EndLine
@@ -328,32 +431,32 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				if best != nil {
-					m.cursorLine = best.endLine
-					m.cursorOnAnnotation = true
-					m.cursorAnnoIdx = best.idx
+					t.cursorLine = best.endLine
+					t.cursorOnAnnotation = true
+					t.cursorAnnoIdx = best.idx
 					moved = true
 				}
 			}
 		case key.Matches(msg, keys.PrevComment):
-			if m.state != nil && len(m.state.Comments) > 0 {
+			if t.state != nil && len(t.state.Comments) > 0 {
 				type target struct {
 					endLine int
 					idx     int
 				}
 				var best *target
-				for _, c := range m.state.Comments {
+				for _, c := range t.state.Comments {
 					endAt := c.Line
 					if c.EndLine > 0 {
 						endAt = c.EndLine
 					}
-					if endAt < m.cursorLine || (endAt == m.cursorLine && !m.cursorOnAnnotation) {
+					if endAt < t.cursorLine || (endAt == t.cursorLine && !t.cursorOnAnnotation) {
 						if best == nil || endAt > best.endLine {
 							best = &target{endLine: endAt, idx: 0}
 						}
 					}
 				}
 				if best == nil {
-					for _, c := range m.state.Comments {
+					for _, c := range t.state.Comments {
 						endAt := c.Line
 						if c.EndLine > 0 {
 							endAt = c.EndLine
@@ -364,17 +467,57 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				if best != nil {
-					m.cursorLine = best.endLine
-					m.cursorOnAnnotation = true
-					m.cursorAnnoIdx = best.idx
+					t.cursorLine = best.endLine
+					t.cursorOnAnnotation = true
+					t.cursorAnnoIdx = best.idx
 					moved = true
 				}
 			}
+		case key.Matches(msg, keys.NextChange):
+			if len(t.changeChunks) > 0 {
+				target := -1
+				for i, chunk := range t.changeChunks {
+					if chunk.startLine > t.cursorLine {
+						target = i
+						break
+					}
+				}
+				if target == -1 {
+					target = 0
+				}
+				chunk := t.changeChunks[target]
+				t.cursorLine = chunk.startLine
+				t.cursorOnAnnotation = false
+				t.cursorAnnoIdx = 0
+				m.rebuildContent()
+				m.scrollToChunk(chunk)
+				return m, nil
+			}
+		case key.Matches(msg, keys.PrevChange):
+			if len(t.changeChunks) > 0 {
+				target := -1
+				for i := len(t.changeChunks) - 1; i >= 0; i-- {
+					if t.changeChunks[i].startLine < t.cursorLine {
+						target = i
+						break
+					}
+				}
+				if target == -1 {
+					target = len(t.changeChunks) - 1
+				}
+				chunk := t.changeChunks[target]
+				t.cursorLine = chunk.startLine
+				t.cursorOnAnnotation = false
+				t.cursorAnnoIdx = 0
+				m.rebuildContent()
+				m.scrollToChunk(chunk)
+				return m, nil
+			}
 		case key.Matches(msg, keys.Confirm):
-			if m.cursorOnAnnotation {
-				anns := m.annotationsAfterLine(m.cursorLine)
-				if m.cursorAnnoIdx < len(anns) {
-					ann := anns[m.cursorAnnoIdx]
+			if t.cursorOnAnnotation {
+				anns := m.annotationsAfterLine(t.cursorLine)
+				if t.cursorAnnoIdx < len(anns) {
+					ann := anns[t.cursorAnnoIdx]
 					m.editingID = ann.id
 					m.modal = editModal
 					m.modalFocus = 0
@@ -384,7 +527,7 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 					m.modalTextarea.Focus()
 					return m, nil
 				}
-			} else if m.state != nil {
+			} else if t.state != nil {
 				m.modal = commentModal
 				m.modalFocus = 0
 				m.modalTextarea.Placeholder = "Type your comment..."
@@ -402,38 +545,38 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Comment pane navigation
-	if m.focused == commentPane && len(m.sidebarItems) > 0 {
+	if m.focused == commentPane && len(t.sidebarItems) > 0 {
 		sidebarMoved := false
 		switch {
 		case key.Matches(msg, keys.Down):
-			if m.sidebarCursor < len(m.sidebarItems)-1 {
-				m.sidebarCursor++
+			if t.sidebarCursor < len(t.sidebarItems)-1 {
+				t.sidebarCursor++
 				sidebarMoved = true
 			}
 		case key.Matches(msg, keys.Up):
-			if m.sidebarCursor > 0 {
-				m.sidebarCursor--
+			if t.sidebarCursor > 0 {
+				t.sidebarCursor--
 				sidebarMoved = true
 			}
 		case key.Matches(msg, keys.Top):
-			m.sidebarCursor = 0
+			t.sidebarCursor = 0
 			sidebarMoved = true
 		case key.Matches(msg, keys.Bottom):
-			m.sidebarCursor = len(m.sidebarItems) - 1
+			t.sidebarCursor = len(t.sidebarItems) - 1
 			sidebarMoved = true
 		}
 		if sidebarMoved {
 			m.updateCommentSidebar()
 			m.rebuildContent()
-			sel := m.sidebarItems[m.sidebarCursor]
-			m.cursorLine = sel.line
+			sel := t.sidebarItems[t.sidebarCursor]
+			t.cursorLine = sel.line
 			m.scrollToAnnotation(sel.line, sel.endLine)
 			return m, nil
 		}
 
 		// Enter to edit selected annotation
 		if key.Matches(msg, keys.Confirm) {
-			sel := m.sidebarItems[m.sidebarCursor]
+			sel := t.sidebarItems[t.sidebarCursor]
 			m.editingID = sel.id
 			m.modal = editModal
 			m.modalFocus = 0
@@ -449,15 +592,16 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *AppModel) modalSubmit() {
+	t := m.tab()
 	body := strings.TrimSpace(m.modalTextarea.Value())
-	if body == "" || m.state == nil {
+	if body == "" || t.state == nil {
 		return
 	}
 
 	if m.modal == editModal {
-		for i := range m.state.Comments {
-			if m.state.Comments[i].ID == m.editingID {
-				m.state.Comments[i].Body = body
+		for i := range t.state.Comments {
+			if t.state.Comments[i].ID == m.editingID {
+				t.state.Comments[i].Body = body
 				break
 			}
 		}
@@ -465,8 +609,8 @@ func (m *AppModel) modalSubmit() {
 	} else {
 		startLine, endLine := m.selectionRange()
 		snippet := ""
-		if m.doc != nil {
-			snippet = strings.TrimSpace(m.doc.LineAt(startLine))
+		if t.doc != nil {
+			snippet = strings.TrimSpace(t.doc.LineAt(startLine))
 		}
 
 		c := review.Comment{
@@ -479,28 +623,29 @@ func (m *AppModel) modalSubmit() {
 		if startLine != endLine {
 			c.EndLine = endLine
 		}
-		m.state.AddComment(c)
+		t.state.AddComment(c)
 	}
 
-	review.Save(m.state)
+	review.Save(t.state)
 	m.modal = noModal
 	m.modalTextarea.Blur()
-	m.selecting = false
+	t.selecting = false
 	m.rebuildContent()
 	m.updateCommentSidebar()
 }
 
 func (m *AppModel) modalDelete() {
-	if m.state == nil || m.editingID == "" {
+	t := m.tab()
+	if t.state == nil || m.editingID == "" {
 		return
 	}
-	m.state.DeleteComment(m.editingID)
+	t.state.DeleteComment(m.editingID)
 	m.editingID = ""
-	review.Save(m.state)
+	review.Save(t.state)
 	m.modal = noModal
 	m.modalTextarea.Blur()
-	m.cursorOnAnnotation = false
-	m.cursorAnnoIdx = 0
+	t.cursorOnAnnotation = false
+	t.cursorAnnoIdx = 0
 	m.rebuildContent()
 	m.updateCommentSidebar()
 }
@@ -554,28 +699,91 @@ func (m *AppModel) handleTextModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *AppModel) handleTabSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.tabSearching = false
+		m.tabSearch = ""
+		m.tabMatches = nil
+		return m, nil
+	case "enter":
+		if len(m.tabMatches) > 0 {
+			m.activeTab = m.tabMatches[0]
+			m.rebuildContent()
+			m.updateCommentSidebar()
+		}
+		m.tabSearching = false
+		m.tabSearch = ""
+		m.tabMatches = nil
+		return m, nil
+	case "backspace":
+		if len(m.tabSearch) > 0 {
+			m.tabSearch = m.tabSearch[:len(m.tabSearch)-1]
+			m.updateTabSearchMatches()
+		}
+		return m, nil
+	case "tab":
+		// Cycle to next match
+		if len(m.tabMatches) > 1 {
+			// Rotate matches
+			m.tabMatches = append(m.tabMatches[1:], m.tabMatches[0])
+		}
+		return m, nil
+	default:
+		s := msg.String()
+		if len(s) == 1 && s[0] >= ' ' && s[0] <= '~' {
+			m.tabSearch += s
+			m.updateTabSearchMatches()
+		}
+		return m, nil
+	}
+}
+
+func (m *AppModel) updateTabSearchMatches() {
+	m.tabMatches = nil
+	if m.tabSearch == "" {
+		return
+	}
+	query := strings.ToLower(m.tabSearch)
+	for i, t := range m.tabs {
+		if strings.Contains(strings.ToLower(t.path), query) {
+			m.tabMatches = append(m.tabMatches, i)
+		}
+	}
+}
+
 func (m *AppModel) recalculateLayout() {
 	headerHeight := 1
 	if m.detached {
 		headerHeight = 2
+	}
+	tabBarHeight := 0
+	if m.multiFile {
+		tabBarHeight = 3 // bordered tabs: top border + content + bottom border
 	}
 	footerHeight := 1
 	tmuxPadding := 0
 	if os.Getenv("TMUX") != "" {
 		tmuxPadding = 1
 	}
-	mainHeight := m.height - headerHeight - footerHeight - 2 - tmuxPadding
+	frameBorderHeight := 0
+	frameBorderWidth := 0
+	if m.multiFile {
+		frameBorderHeight = 1 // bottom border
+		frameBorderWidth = 2  // left + right borders
+	}
+	mainHeight := m.height - headerHeight - tabBarHeight - footerHeight - frameBorderHeight - tmuxPadding
 
 	commentWidth := m.width / 4
 	if commentWidth < 20 {
 		commentWidth = 20
 	}
-	contentWidth := m.width - commentWidth
+	contentWidth := m.width - commentWidth - frameBorderWidth
 
-	m.contentViewport.SetWidth(contentWidth - 4)
+	m.contentViewport.SetWidth(contentWidth)
 	m.contentViewport.SetHeight(mainHeight)
-	m.commentViewport.SetWidth(commentWidth - 4)
-	m.commentViewport.SetHeight(mainHeight - 1) // -1 for the "Comments (N)" header line
+	m.commentViewport.SetWidth(commentWidth - 3) // -3 for left border + padding + margin
+	m.commentViewport.SetHeight(mainHeight - 1)  // -1 for the "Comments (N)" header line
 
 	modalWidth := m.width * 2 / 3
 	if modalWidth < 50 {
@@ -591,11 +799,12 @@ func (m *AppModel) recalculateLayout() {
 // annotationsAfterLine returns annotations that render after the given line
 // (keyed by their endLine).
 func (m *AppModel) annotationsAfterLine(lineNum int) []annotation {
-	if m.state == nil {
+	t := m.tab()
+	if t.state == nil {
 		return nil
 	}
 	var anns []annotation
-	for _, c := range m.state.Comments {
+	for _, c := range t.state.Comments {
 		endAt := c.Line
 		if c.EndLine > 0 {
 			endAt = c.EndLine
@@ -629,14 +838,26 @@ type annotation struct {
 // rebuildContent renders the document line-by-line with cursor, selection,
 // line numbers, and bordered inline annotations.
 func (m *AppModel) rebuildContent() {
-	if m.doc == nil {
+	t := m.tab()
+
+	// Handle placeholder tabs
+	if t.isBinary {
+		m.contentViewport.SetContent("\n  Binary file changed — cannot display content.\n")
+		return
+	}
+	if t.isDeleted {
+		m.contentViewport.SetContent("\n  File deleted.\n")
+		return
+	}
+
+	if t.doc == nil {
 		return
 	}
 
 	// Collect annotations keyed by the line they appear AFTER
 	annosByEndLine := make(map[int][]annotation)
-	if m.state != nil {
-		for _, c := range m.state.Comments {
+	if t.state != nil {
+		for _, c := range t.state.Comments {
 			endAt := c.Line
 			if c.EndLine > 0 {
 				endAt = c.EndLine
@@ -650,8 +871,8 @@ func (m *AppModel) rebuildContent() {
 
 	// Count how many comments cover each line (for overlap detection)
 	annotatedLines := make(map[int]int)
-	if m.state != nil {
-		for _, c := range m.state.Comments {
+	if t.state != nil {
+		for _, c := range t.state.Comments {
 			end := c.Line
 			if c.EndLine > 0 {
 				end = c.EndLine
@@ -666,17 +887,17 @@ func (m *AppModel) rebuildContent() {
 
 	// Determine which lines to highlight from selected annotation
 	var sidebarHighlightStart, sidebarHighlightEnd int
-	if m.focused == commentPane && len(m.sidebarItems) > 0 && m.sidebarCursor < len(m.sidebarItems) {
-		sel := m.sidebarItems[m.sidebarCursor]
+	if m.focused == commentPane && len(t.sidebarItems) > 0 && t.sidebarCursor < len(t.sidebarItems) {
+		sel := t.sidebarItems[t.sidebarCursor]
 		sidebarHighlightStart = sel.line
 		sidebarHighlightEnd = sel.line
 		if sel.endLine > 0 {
 			sidebarHighlightEnd = sel.endLine
 		}
-	} else if m.focused == contentPane && m.cursorOnAnnotation {
-		anns := m.annotationsAfterLine(m.cursorLine)
-		if m.cursorAnnoIdx < len(anns) {
-			ann := anns[m.cursorAnnoIdx]
+	} else if m.focused == contentPane && t.cursorOnAnnotation {
+		anns := m.annotationsAfterLine(t.cursorLine)
+		if t.cursorAnnoIdx < len(anns) {
+			ann := anns[t.cursorAnnoIdx]
 			sidebarHighlightStart = ann.line
 			sidebarHighlightEnd = ann.line
 			if ann.endLine > 0 {
@@ -696,8 +917,12 @@ func (m *AppModel) rebuildContent() {
 		textWidth = 10
 	}
 
+	// Use cached syntax highlighting
+	isMarkdown := t.isMarkdown
+	chromaLines := t.chromaLines
+
 	// Detect table blocks so we can align columns across rows
-	tableBlocks := detectTableBlocks(m.doc.Lines)
+	tableBlocks := detectTableBlocks(t.doc.Lines)
 	tableBlockMap := make(map[int]*tableBlock)
 	for i := range tableBlocks {
 		tb := &tableBlocks[i]
@@ -706,17 +931,44 @@ func (m *AppModel) rebuildContent() {
 		}
 	}
 
+	// inlineBg applies a background color to just the content text (no full-width padding).
+	// For content with embedded ANSI codes (Chroma), it re-injects the bg after resets.
+	inlineBg := func(style lipgloss.Style, content string) string {
+		bgAnsi := bgToAnsi(style.GetBackground())
+		if bgAnsi == "" {
+			return style.Render(content)
+		}
+		patched := strings.ReplaceAll(content, "\033[0m", "\033[0m"+bgAnsi)
+		return bgAnsi + patched + "\033[0m"
+	}
+
 	var b strings.Builder
-	for i, line := range m.doc.Lines {
+	b.Grow(len(t.doc.Lines) * 200) // pre-allocate to reduce allocations
+	for i, line := range t.doc.Lines {
 		lineNum := i + 1
 
-		isCursor := lineNum == m.cursorLine
-		isSelected := m.selecting && lineNum >= selStart && lineNum <= selEnd
+		// Render deleted lines that appear before this line
+		if dels, ok := t.deletedAfter[lineNum-1]; ok {
+			cachedHL := t.deletedLineCache[lineNum-1]
+			for di, del := range dels {
+				delMarker := diffDeletedGutter.Render("-")
+				delNum := diffDeletedLineNum.Render(fmt.Sprintf("%d", del.OldLineNum))
+				delContent := del.Content
+				if cachedHL != nil && di < len(cachedHL) {
+					delContent = cachedHL[di]
+				}
+				b.WriteString(fmt.Sprintf("%s%s %s\n", delMarker, delNum, inlineBg(diffDeletedLineBg, delContent)))
+			}
+		}
+
+		isCursor := lineNum == t.cursorLine
+		isSelected := t.selecting && lineNum >= selStart && lineNum <= selEnd
 		isSidebarHighlight := sidebarHighlightStart > 0 && lineNum >= sidebarHighlightStart && lineNum <= sidebarHighlightEnd
+		isChanged := t.changedLines != nil && t.changedLines[lineNum]
 
 		// Marker column
 		var marker string
-		if isCursor && !m.cursorOnAnnotation {
+		if isCursor && !t.cursorOnAnnotation {
 			marker = cursorMarker.Render(">")
 		} else if isSelected {
 			marker = selectedMarker.Render("|")
@@ -728,6 +980,8 @@ func (m *AppModel) rebuildContent() {
 			} else {
 				marker = annotationGutter.Render("■")
 			}
+		} else if isChanged {
+			marker = diffAddedGutter.Render("+")
 		} else {
 			marker = " "
 		}
@@ -753,29 +1007,56 @@ func (m *AppModel) rebuildContent() {
 			}
 
 			if isSelected {
-				styledLine = selectedLineBg.Render(styledLine)
+				styledLine = inlineBg(selectedLineBg, styledLine)
 			} else if isSidebarHighlight {
-				styledLine = sidebarHighlightBg.Render(styledLine)
+				styledLine = inlineBg(sidebarHighlightBg, styledLine)
+			} else if isChanged {
+				styledLine = inlineBg(diffChangedLineBg, styledLine)
 			}
 
 			b.WriteString(fmt.Sprintf("%s%s %s\n", marker, numStr, styledLine))
 		} else {
-			lineContent := line
-
-			styleFunc := func(s string) string { return highlightMarkdown(s) }
-			if isSelected {
-				styleFunc = func(s string) string { return selectedLineBg.Render(s) }
-			} else if isSidebarHighlight {
-				styleFunc = func(s string) string { return sidebarHighlightBg.Render(s) }
+			// Get the display content: Chroma-highlighted or raw
+			displayLine := line
+			if !isMarkdown && chromaLines != nil && i < len(chromaLines) {
+				displayLine = chromaLines[i]
 			}
 
-			wrapped := lipgloss.Wrap(lineContent, textWidth, "")
-			wrappedLines := strings.Split(wrapped, "\n")
-			for wi, wl := range wrappedLines {
-				if wi == 0 {
-					b.WriteString(fmt.Sprintf("%s%s %s\n", marker, numStr, styleFunc(wl)))
-				} else {
-					b.WriteString(fmt.Sprintf(" %s %s\n", continuationGutter, styleFunc(wl)))
+			// For Chroma-highlighted content, we skip wrapping (ANSI codes break lipgloss.Wrap)
+			// and apply background overlays directly.
+			if !isMarkdown && chromaLines != nil && i < len(chromaLines) {
+				styledLine := displayLine
+				if isSelected {
+					styledLine = inlineBg(selectedLineBg, styledLine)
+				} else if isSidebarHighlight {
+					styledLine = inlineBg(sidebarHighlightBg, styledLine)
+				} else if isChanged {
+					styledLine = inlineBg(diffChangedLineBg, styledLine)
+				}
+				b.WriteString(fmt.Sprintf("%s%s %s\n", marker, numStr, styledLine))
+			} else {
+				// Markdown or plain text path with wrapping
+				styleFunc := func(s string) string { return s }
+				if isMarkdown {
+					styleFunc = func(s string) string { return highlightMarkdown(s) }
+				}
+				if isSelected {
+					styleFunc = func(s string) string { return inlineBg(selectedLineBg, s) }
+				} else if isSidebarHighlight {
+					styleFunc = func(s string) string { return inlineBg(sidebarHighlightBg, s) }
+				} else if isChanged {
+					base := styleFunc
+					styleFunc = func(s string) string { return inlineBg(diffChangedLineBg, base(s)) }
+				}
+
+				wrapped := lipgloss.Wrap(line, textWidth, "")
+				wrappedLines := strings.Split(wrapped, "\n")
+				for wi, wl := range wrappedLines {
+					if wi == 0 {
+						b.WriteString(fmt.Sprintf("%s%s %s\n", marker, numStr, styleFunc(wl)))
+					} else {
+						b.WriteString(fmt.Sprintf(" %s %s\n", continuationGutter, styleFunc(wl)))
+					}
 				}
 			}
 		}
@@ -783,7 +1064,7 @@ func (m *AppModel) rebuildContent() {
 		// Render inline annotations after this line
 		if anns, ok := annosByEndLine[lineNum]; ok {
 			for idx, ann := range anns {
-				focused := m.focused == contentPane && m.cursorOnAnnotation && m.cursorLine == lineNum && m.cursorAnnoIdx == idx
+				focused := m.focused == contentPane && t.cursorOnAnnotation && t.cursorLine == lineNum && t.cursorAnnoIdx == idx
 				b.WriteString(m.renderAnnotationBox(ann, boxWidth, focused))
 			}
 		}
@@ -1034,18 +1315,19 @@ func highlightInline(line string) string {
 }
 
 func (m *AppModel) scrollToCursor() {
-	if m.doc == nil {
+	t := m.tab()
+	if t.doc == nil {
 		return
 	}
 
 	renderedLine := 0
 	extraCounts := m.extraLinesPerDocLine()
-	for i := 1; i < m.cursorLine; i++ {
+	for i := 1; i < t.cursorLine; i++ {
 		renderedLine++
 		renderedLine += extraCounts[i]
 	}
 
-	cursorBottom := renderedLine + 1 + extraCounts[m.cursorLine]
+	cursorBottom := renderedLine + 1 + extraCounts[t.cursorLine]
 
 	vpHeight := m.contentViewport.Height()
 	currentTop := m.contentViewport.YOffset()
@@ -1058,8 +1340,54 @@ func (m *AppModel) scrollToCursor() {
 	}
 }
 
+const chunkScrollPadding = 4
+
+// scrollToChunk scrolls the viewport to show the entire change chunk
+// plus padding lines above and below for context.
+func (m *AppModel) scrollToChunk(chunk changeChunk) {
+	t := m.tab()
+	if t.doc == nil {
+		return
+	}
+
+	extraCounts := m.extraLinesPerDocLine()
+
+	// Compute rendered line for chunk start - padding
+	startLine := chunk.startLine - chunkScrollPadding
+	if startLine < 1 {
+		startLine = 1
+	}
+	startRendered := 0
+	for i := 1; i < startLine; i++ {
+		startRendered++
+		startRendered += extraCounts[i]
+	}
+
+	// Compute rendered line for chunk end + padding
+	endLine := chunk.endLine + chunkScrollPadding
+	if endLine > t.doc.LineCount() {
+		endLine = t.doc.LineCount()
+	}
+	endRendered := 0
+	for i := 1; i <= endLine; i++ {
+		endRendered++
+		endRendered += extraCounts[i]
+	}
+
+	vpHeight := m.contentViewport.Height()
+
+	// If the whole chunk+padding fits, position start at top
+	if endRendered-startRendered <= vpHeight {
+		m.contentViewport.SetYOffset(startRendered)
+	} else {
+		// Chunk is taller than viewport — just put cursor near top with padding
+		m.contentViewport.SetYOffset(startRendered)
+	}
+}
+
 func (m *AppModel) scrollToAnnotation(startLine, endLine int) {
-	if m.doc == nil {
+	t := m.tab()
+	if t.doc == nil {
 		return
 	}
 	if endLine == 0 {
@@ -1094,8 +1422,9 @@ func (m *AppModel) scrollToAnnotation(startLine, endLine int) {
 }
 
 func (m *AppModel) extraLinesPerDocLine() map[int]int {
+	t := m.tab()
 	counts := make(map[int]int)
-	if m.doc == nil {
+	if t.doc == nil {
 		return counts
 	}
 
@@ -1105,7 +1434,7 @@ func (m *AppModel) extraLinesPerDocLine() map[int]int {
 		textWidth = 10
 	}
 
-	for i, line := range m.doc.Lines {
+	for i, line := range t.doc.Lines {
 		lineNum := i + 1
 		wrapped := lipgloss.Wrap(line, textWidth, "")
 		wrapCount := strings.Count(wrapped, "\n")
@@ -1114,8 +1443,8 @@ func (m *AppModel) extraLinesPerDocLine() map[int]int {
 		}
 	}
 
-	if m.state != nil {
-		for _, c := range m.state.Comments {
+	if t.state != nil {
+		for _, c := range t.state.Comments {
 			endAt := c.Line
 			if c.EndLine > 0 {
 				endAt = c.EndLine
@@ -1124,40 +1453,53 @@ func (m *AppModel) extraLinesPerDocLine() map[int]int {
 			counts[endAt] += bodyLines + 3
 		}
 	}
+
+	// Account for deleted lines rendered before each doc line
+	if t.deletedAfter != nil {
+		for afterLine, dels := range t.deletedAfter {
+			targetLine := afterLine + 1
+			if targetLine < 1 {
+				targetLine = 1
+			}
+			counts[targetLine] += len(dels)
+		}
+	}
+
 	return counts
 }
 
 func (m *AppModel) updateCommentSidebar() {
-	if m.state == nil {
+	t := m.tab()
+	if t.state == nil {
 		return
 	}
 
-	m.sidebarItems = nil
-	for _, c := range m.state.Comments {
-		m.sidebarItems = append(m.sidebarItems, sidebarItem{
+	t.sidebarItems = nil
+	for _, c := range t.state.Comments {
+		t.sidebarItems = append(t.sidebarItems, sidebarItem{
 			id: c.ID, line: c.Line, endLine: c.EndLine,
 			body: c.Body,
 		})
 	}
-	sort.Slice(m.sidebarItems, func(i, j int) bool { return m.sidebarItems[i].line < m.sidebarItems[j].line })
+	sort.Slice(t.sidebarItems, func(i, j int) bool { return t.sidebarItems[i].line < t.sidebarItems[j].line })
 
-	if m.sidebarCursor >= len(m.sidebarItems) {
-		m.sidebarCursor = len(m.sidebarItems) - 1
+	if t.sidebarCursor >= len(t.sidebarItems) {
+		t.sidebarCursor = len(t.sidebarItems) - 1
 	}
-	if m.sidebarCursor < 0 {
-		m.sidebarCursor = 0
+	if t.sidebarCursor < 0 {
+		t.sidebarCursor = 0
 	}
 
 	var b strings.Builder
 
-	if len(m.sidebarItems) == 0 {
+	if len(t.sidebarItems) == 0 {
 		b.WriteString(commentStyle.Render("No comments yet.\n\nPress enter to comment.\n\nUse 'v' to select\nmultiple lines first."))
 		m.commentViewport.SetContent(b.String())
 		return
 	}
 
-	for idx, it := range m.sidebarItems {
-		isSelected := m.focused == commentPane && idx == m.sidebarCursor
+	for idx, it := range t.sidebarItems {
+		isSelected := m.focused == commentPane && idx == t.sidebarCursor
 
 		var lineInfo string
 		if it.endLine > 0 {
@@ -1202,21 +1544,29 @@ func (m AppModel) View() tea.View {
 		return v
 	}
 
-	if m.width == 0 || m.state == nil {
+	if m.width == 0 || len(m.tabs) == 0 || m.tab().state == nil {
 		v := tea.NewView("Loading...")
 		v.AltScreen = true
 		return v
 	}
 
+	t := m.tab()
+
 	// Header
-	commentCount := len(m.state.Comments)
+	commentCount := len(t.state.Comments)
+	displayPath := t.path
+	if m.filePath != "" {
+		displayPath = m.filePath
+	}
 	var headerContent string
-	if m.selecting {
+	if t.selecting {
 		start, end := m.selectionRange()
 		selLabel := visualModeIndicator.Render("VISUAL")
-		headerContent = fmt.Sprintf(" Crit: %s  %s L%d-%d", m.filePath, selLabel, start, end)
+		headerContent = fmt.Sprintf(" Crit: %s  %s L%d-%d", displayPath, selLabel, start, end)
+	} else if t.doc != nil {
+		headerContent = fmt.Sprintf(" Crit: %s  %d comments  L%d/%d", displayPath, commentCount, t.cursorLine, t.doc.LineCount())
 	} else {
-		headerContent = fmt.Sprintf(" Crit: %s  %d comments  L%d/%d", m.filePath, commentCount, m.cursorLine, m.doc.LineCount())
+		headerContent = fmt.Sprintf(" Crit: %s  %d comments", displayPath, commentCount)
 	}
 	var header string
 	if m.detached {
@@ -1226,42 +1576,69 @@ func (m AppModel) View() tea.View {
 		header = headerStyle.Width(m.width).Render(headerContent)
 	}
 
-	// Content pane
-	contentBorder := blurredBorder
-	if m.focused == contentPane {
-		contentBorder = focusedBorder
+	// Tab bar (multi-file mode)
+	var tabBar string
+	if m.multiFile {
+		tabBar = m.renderTabBar()
 	}
 
+	// Content pane
 	commentWidth := m.width / 4
 	if commentWidth < 20 {
 		commentWidth = 20
 	}
 	contentWidth := m.width - commentWidth
 
-	panelHeight := m.contentViewport.Height() + 2
+	panelHeight := m.contentViewport.Height()
 
-	contentBox := contentBorder.
-		Width(contentWidth - 2).
+	contentBox := lipgloss.NewStyle().
+		Width(contentWidth).
 		Height(panelHeight).
 		Render(m.contentViewport.View())
 
-	// Comment sidebar
-	commentBorder := blurredBorder
+	// Comment sidebar (left border to separate from content)
+	sidebarBorderColor := subtle
 	if m.focused == commentPane {
-		commentBorder = focusedBorder
+		sidebarBorderColor = accent
 	}
-
+	sidebarBorder := lipgloss.Border{Left: "│"}
 	commentHeader := lipgloss.NewStyle().Bold(true).Foreground(accent).Render(fmt.Sprintf("Comments (%d)", commentCount))
-	commentBox := commentBorder.
+	commentBox := lipgloss.NewStyle().
+		Border(sidebarBorder, false, false, false, true).
+		BorderForeground(sidebarBorderColor).
 		Width(commentWidth - 2).
 		Height(panelHeight).
+		PaddingLeft(1).
 		Render(commentHeader + "\n" + m.commentViewport.View())
 
 	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, contentBox, commentBox)
 
+	// Wrap content in a frame: │ left/right borders, ╰───╯ bottom.
+	// The tab bar serves as the top border.
+	if m.multiFile {
+		borderColor := lipgloss.NewStyle().Foreground(accent)
+		lines := strings.Split(mainRow, "\n")
+		var framed strings.Builder
+		left := borderColor.Render("│")
+		right := borderColor.Render("│")
+		for _, line := range lines {
+			framed.WriteString(left + line + right + "\n")
+		}
+		bottom := borderColor.Render("╰" + strings.Repeat("─", m.width-2) + "╯")
+		framed.WriteString(bottom)
+		mainRow = framed.String()
+	}
+
 	footer := m.renderFooter()
 
-	full := lipgloss.JoinVertical(lipgloss.Left, header, mainRow, footer)
+	var sections []string
+	sections = append(sections, header)
+	if tabBar != "" {
+		sections = append(sections, tabBar)
+	}
+	sections = append(sections, mainRow, footer)
+
+	full := lipgloss.JoinVertical(lipgloss.Left, sections...)
 
 	if m.modal != noModal {
 		full = m.renderWithModal(full)
@@ -1272,13 +1649,177 @@ func (m AppModel) View() tea.View {
 	return v
 }
 
+// renderTabBar renders the tab bar for multi-file mode.
+func (m *AppModel) renderTabBar() string {
+	if m.tabSearching {
+		prompt := tabSearchPromptStyle.Render("/")
+		query := m.tabSearch
+		matchInfo := ""
+		if m.tabSearch != "" {
+			matchInfo = fmt.Sprintf(" (%d matches)", len(m.tabMatches))
+		}
+		return prompt + query + footerStyle.Render(matchInfo)
+	}
+
+	// Disambiguate filenames — use basename unless there are collisions
+	basenames := make(map[string]int)
+	for _, t := range m.tabs {
+		base := filepath.Base(t.path)
+		basenames[base]++
+	}
+
+	type tabLabel struct {
+		text     string
+		rendered string
+		width    int
+	}
+
+	labels := make([]tabLabel, len(m.tabs))
+	for i, t := range m.tabs {
+		label := filepath.Base(t.path)
+		if basenames[label] > 1 {
+			label = t.path
+		}
+		if n := len(t.changedLines); n > 0 {
+			label += " " + tabChangeCount.Render(fmt.Sprintf("(+%d)", n))
+		}
+		labels[i] = tabLabel{text: label}
+	}
+	// Render a single tab with correct border corners for its position.
+	// isFirst adjusts the left corner to connect to the outer frame border.
+	renderTab := func(i int, isFirst bool) string {
+		var style lipgloss.Style
+		isActive := i == m.activeTab
+		if isActive {
+			style = activeTabStyle
+		} else {
+			style = inactiveTabStyle
+		}
+		border, _, _, _, _ := style.GetBorder()
+		if isFirst && isActive {
+			border.BottomLeft = "│"
+		} else if isFirst && !isActive {
+			border.BottomLeft = "├"
+		}
+		style = style.Border(border)
+		return style.Render(labels[i].text)
+	}
+	for i := range labels {
+		rendered := renderTab(i, i == 0)
+		labels[i].rendered = rendered
+		labels[i].width = lipgloss.Width(rendered)
+	}
+
+	// addFiller extends the tab bottom border to the full width,
+	// connecting to the outer frame's right border.
+	addFiller := func(row string) string {
+		rowW := lipgloss.Width(row)
+		if rowW >= m.width {
+			return row
+		}
+		// 3 lines matching tab height: empty top, empty middle, ───╮ bottom
+		gap := m.width - rowW
+		topFill := strings.Repeat(" ", gap)
+		midFill := strings.Repeat(" ", gap)
+		botFill := strings.Repeat("─", gap-1) + "╮"
+		filler := lipgloss.NewStyle().Foreground(accent).Render(
+			topFill + "\n" + midFill + "\n" + botFill,
+		)
+		return lipgloss.JoinHorizontal(lipgloss.Top, row, filler)
+	}
+
+	// Check if all tabs fit
+	totalWidth := 0
+	for _, l := range labels {
+		totalWidth += l.width
+	}
+
+	if totalWidth <= m.width {
+		var tabs []string
+		for i := range labels {
+			tabs = append(tabs, labels[i].rendered)
+		}
+		row := lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
+		return addFiller(row)
+	}
+
+	// Overflow: show a window of tabs centered on the active tab.
+	// Indicators are styled as bordered tabs to align with the tab row.
+	renderIndicator := func(text string, isFirst bool) string {
+		style := inactiveTabStyle.Foreground(subtle)
+		border, _, _, _, _ := style.GetBorder()
+		if isFirst {
+			border.BottomLeft = "├"
+		}
+		style = style.Border(border)
+		return style.Render(text)
+	}
+
+	leftIndicator := ""
+	rightIndicator := ""
+	leftW := 0
+	rightW := 0
+	// Pre-render indicators to know their width for available space calc
+	if m.activeTab > 0 {
+		leftIndicator = renderIndicator(fmt.Sprintf("↤ %d more", m.activeTab), true)
+		leftW = lipgloss.Width(leftIndicator)
+	}
+	if m.activeTab < len(labels)-1 {
+		rightIndicator = renderIndicator(fmt.Sprintf("%d more ↦", len(labels)-m.activeTab-1), false)
+		rightW = lipgloss.Width(rightIndicator)
+	}
+
+	availWidth := m.width - leftW - rightW
+
+	// Find the window of tabs that fits
+	start := m.activeTab
+	end := m.activeTab + 1
+	used := labels[m.activeTab].width
+
+	// Expand window outward from active tab
+	for {
+		expanded := false
+		if start > 0 && used+labels[start-1].width <= availWidth {
+			start--
+			used += labels[start].width
+			expanded = true
+		}
+		if end < len(labels) && used+labels[end].width <= availWidth {
+			used += labels[end].width
+			end++
+			expanded = true
+		}
+		if !expanded {
+			break
+		}
+	}
+
+	// Re-render indicators with actual counts now that we know the visible window
+	var parts []string
+	if start > 0 {
+		ind := renderIndicator(fmt.Sprintf("↤ %d more", start), true)
+		parts = append(parts, ind)
+	}
+	for i := start; i < end; i++ {
+		parts = append(parts, renderTab(i, i == start && start == 0))
+	}
+	if end < len(labels) {
+		ind := renderIndicator(fmt.Sprintf("%d more ↦", len(labels)-end), false)
+		parts = append(parts, ind)
+	}
+
+	row := lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+	return addFiller(row)
+}
+
 func (m AppModel) renderFooter() string {
+	t := m.tabs[m.activeTab]
 	k := func(key, desc string) string {
 		return footerKeyStyle.Render(key) + " " + footerStyle.Render(desc)
 	}
 
 	var items []string
-	if m.selecting {
+	if t.selecting {
 		items = []string{
 			k("j/k", "extend"),
 			k("enter", "comment selection"),
@@ -1290,10 +1831,16 @@ func (m AppModel) renderFooter() string {
 			k("j/k", "move"),
 			k("[/]", "prev/next comment"),
 			k("shift+↑↓", "page"),
-			k("tab", "pane"),
+			k("s", "sidebar"),
 			k("v", "select"),
 			k("enter", "comment"),
 			k("q", "save & quit"),
+		}
+		if m.multiFile {
+			items = append([]string{
+				k("tab/S-tab", "next/prev tab"),
+				k("n/N", "next/prev change"),
+			}, items...)
 		}
 	}
 
@@ -1318,7 +1865,8 @@ func (m AppModel) renderDeleteButton(label string, focused bool) string {
 }
 
 func (m AppModel) renderContextPreview(start, end, maxWidth int) string {
-	if m.doc == nil {
+	t := m.tabs[m.activeTab]
+	if t.doc == nil {
 		return ""
 	}
 	var lines []string
@@ -1326,8 +1874,8 @@ func (m AppModel) renderContextPreview(start, end, maxWidth int) string {
 	if maxLineText < 10 {
 		maxLineText = 10
 	}
-	for i := start; i <= end && i <= m.doc.LineCount(); i++ {
-		lineText := m.doc.LineAt(i)
+	for i := start; i <= end && i <= t.doc.LineCount(); i++ {
+		lineText := t.doc.LineAt(i)
 		wrapped := lipgloss.Wrap(lineText, maxLineText, "")
 		num := lineNumStyle.Render(fmt.Sprintf("%d", i))
 		wrapLines := strings.Split(wrapped, "\n")
@@ -1379,7 +1927,7 @@ func (m AppModel) renderWithModal(background string) string {
 	case editModal:
 		title := modalTitleStyle.Render("Edit Comment")
 		var contextSection string
-		for _, c := range m.state.Comments {
+		for _, c := range m.tabs[m.activeTab].state.Comments {
 			if c.ID == m.editingID {
 				start := c.Line
 				end := c.EndLine
