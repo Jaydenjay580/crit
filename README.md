@@ -2,11 +2,13 @@
   <img src="assets/crit_logo.png" alt="crit" width="300">
 </p>
 
-# Crit
+# crit
 
-A terminal-based review tool for documents and code. Read a plan or review code changes across multiple files, leave inline comments, and let Claude Code address your feedback automatically.
+TUI for reviewing AI-generated code and plans — built for human-in-the-loop agentic coding workflows.
 
-Built for the human-in-the-loop workflow: Claude writes code or a plan, you review it in a TUI, Claude reads your comments and makes changes.
+Read a plan or review code changes across multiple files, leave inline comments, and let Claude Code address your feedback automatically.
+
+Built for the human-in-the-loop workflow: Your agent the writes code or a plan, you review it in a TUI, your agent seamlessly reads your comments and makes changes.
 
 ![crit code review demo](demo/code-review.gif)
 
