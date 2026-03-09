@@ -1,50 +1,50 @@
-# Crit — multi-file code review
+# Crit — full code review lifecycle with Claude Code
 
 Output demo/code-review.gif
 
 Require crit
+Require tmux
+Require claude
 
 Set Shell "zsh"
-Set FontSize 16
-Set Width 1400
-Set Height 800
+Set FontSize 14
+Set Width 1800
+Set Height 900
 Set Theme "Catppuccin Mocha"
 Set Padding 20
 Set TypingSpeed 50ms
 Set WindowBar Colorful
 
-# Open multi-file code review
-Type "crit review --code"
+Hide
+
+# Start a tmux session
+Type "tmux new -s demo"
+Enter
+Sleep 1.5s
+
+# Launch Claude Code inside tmux
+Type "claude --dangerously-skip-permissions"
+Enter
+Sleep 5s
+
+Show
+
+# Call the code review skill
+Type@40ms "/crit:code-review"
 Sleep 500ms
 Enter
-Sleep 2s
+Sleep 8s
 
-# Scroll down to see some changes
-Type@80ms "jjjjjjjj"
-Sleep 800ms
-
-# Jump to the next change
-Type "n"
-Sleep 800ms
-
-# Add a comment on this change
-Enter
+# --- Focus is now in the crit TUI split pane (right side) ---
 Sleep 1s
 
-# Type the comment
-Type@40ms "This change looks good but needs a test."
-Sleep 800ms
-
-# Save the comment
-Ctrl+S
-Sleep 1.5s
 
 # Switch to next file tab
 Tab
 Sleep 1.5s
 
 # Scroll through the second file
-Type@80ms "jjjjj"
+Type@80ms "jjjjjj"
 Sleep 800ms
 
 # Jump to next change in this file
@@ -68,6 +68,9 @@ Sleep 800ms
 Ctrl+S
 Sleep 1.5s
 
-# Quit
+# Quit crit — focus returns to Claude Code pane
 Type "q"
-Sleep 2s
+
+# --- Claude is now reading comments and making changes ---
+# Wait for Claude to process comments and start editing files
+Sleep 15s
