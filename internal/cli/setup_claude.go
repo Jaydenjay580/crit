@@ -9,57 +9,76 @@ import (
 	"github.com/spf13/cobra"
 )
 
-//go:embed skill/crit-review/SKILL.md
+//go:embed skill/crit-review/SKILL.md skill/crit-plan-review/SKILL.md skill/crit-code-review/SKILL.md
 var skillContent embed.FS
 
 var setupProject bool
 var setupForce bool
 
+// skills to install: directory name -> display name
+var skillsToInstall = []struct {
+	dir  string
+	name string
+}{
+	{"crit-review", "crit-review"},
+	{"crit-plan-review", "crit-plan-review"},
+	{"crit-code-review", "crit-code-review"},
+}
+
 var setupClaudeCmd = &cobra.Command{
 	Use:   "setup-claude",
-	Short: "Install Claude Code skill for crit review workflow",
-	Long:  "Installs the /crit-review skill to ~/.claude/skills/ (or .claude/skills/ with --project). Alternative to installing the crit plugin via /plugin install.",
+	Short: "Install Claude Code skills for crit review workflow",
+	Long:  "Installs /crit-review, /crit-plan-review, and /crit-code-review skills to ~/.claude/skills/ (or .claude/skills/ with --project). Alternative to installing the crit plugin via /plugin install.",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		var targetDir string
+		var baseDir string
 
 		if setupProject {
-			targetDir = filepath.Join(".claude", "skills", "crit-review")
+			baseDir = filepath.Join(".claude", "skills")
 		} else {
 			home, err := os.UserHomeDir()
 			if err != nil {
 				return fmt.Errorf("could not determine home directory: %w", err)
 			}
-			targetDir = filepath.Join(home, ".claude", "skills", "crit-review")
-		}
-
-		targetPath := filepath.Join(targetDir, "SKILL.md")
-
-		if !setupForce {
-			if _, err := os.Stat(targetPath); err == nil {
-				return fmt.Errorf("skill already exists at %s (use --force to overwrite)", targetPath)
-			}
-		}
-
-		content, err := skillContent.ReadFile("skill/crit-review/SKILL.md")
-		if err != nil {
-			return fmt.Errorf("reading embedded skill: %w", err)
-		}
-
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
-			return fmt.Errorf("creating directory %s: %w", targetDir, err)
-		}
-
-		if err := os.WriteFile(targetPath, content, 0644); err != nil {
-			return fmt.Errorf("writing skill file: %w", err)
+			baseDir = filepath.Join(home, ".claude", "skills")
 		}
 
 		scope := "globally"
 		if setupProject {
 			scope = "for this project"
 		}
-		fmt.Printf("Installed Claude Code skill %s to %s\n", scope, targetPath)
-		fmt.Println("You can now use /crit-review <path> in Claude Code.")
+
+		for _, skill := range skillsToInstall {
+			targetDir := filepath.Join(baseDir, skill.dir)
+			targetPath := filepath.Join(targetDir, "SKILL.md")
+
+			if !setupForce {
+				if _, err := os.Stat(targetPath); err == nil {
+					fmt.Printf("Skipping %s (already exists, use --force to overwrite)\n", skill.name)
+					continue
+				}
+			}
+
+			content, err := skillContent.ReadFile(filepath.Join("skill", skill.dir, "SKILL.md"))
+			if err != nil {
+				return fmt.Errorf("reading embedded skill %s: %w", skill.name, err)
+			}
+
+			if err := os.MkdirAll(targetDir, 0755); err != nil {
+				return fmt.Errorf("creating directory %s: %w", targetDir, err)
+			}
+
+			if err := os.WriteFile(targetPath, content, 0644); err != nil {
+				return fmt.Errorf("writing skill file %s: %w", skill.name, err)
+			}
+
+			fmt.Printf("Installed /%s %s to %s\n", skill.name, scope, targetPath)
+		}
+
+		fmt.Println("\nAvailable skills:")
+		fmt.Println("  /crit-review         — Routes to code or plan review")
+		fmt.Println("  /crit-code-review    — Multi-file code review")
+		fmt.Println("  /crit-plan-review    — Single-file document review")
 		return nil
 	},
 }
