@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,6 +90,214 @@ func TestCodeReviewDetachRequiresTmux(t *testing.T) {
 	if !strings.Contains(err.Error(), "requires a tmux session") {
 		t.Errorf("expected 'requires a tmux session' error, got: %s", err)
 	}
+}
+
+// TestCodeReviewDetachRoutesToDetachedPath verifies that runCodeReview with
+// --detach enters the detached code path rather than launching the TUI directly.
+// This is the fix for https://github.com/kevindutra/crit/issues/2 where
+// --code --detach would bypass the detach check and fail with a TTY error.
+func TestCodeReviewDetachRoutesToDetachedPath(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	origPath := os.Getenv("PATH")
+	os.Setenv("PATH", "")
+	defer os.Setenv("PATH", origPath)
+
+	reviewDetach = true
+	reviewCode = true
+	defer func() {
+		reviewDetach = false
+		reviewCode = false
+	}()
+
+	err := runCodeReview()
+	if err == nil {
+		t.Fatal("expected error from detached path (tmux not on PATH), but got nil")
+	}
+
+	// If we reach the detached path, the error will be about the tmux binary
+	// not being found. If we had NOT entered the detached path, the error
+	// would be about git repo or TUI instead.
+	if !strings.Contains(err.Error(), "tmux binary not found") {
+		t.Errorf("expected 'tmux binary not found' error (proving detached path was taken), got: %s", err)
+	}
+}
+
+// TestWaitWithoutDetachIsIgnored verifies that --wait without --detach
+// does not enter the tmux/detach path — it resets the flag and continues
+// down the normal (non-detached) code path.
+func TestWaitWithoutDetachIsIgnored(t *testing.T) {
+	reviewDetach = false
+	reviewWait = true
+	reviewCode = true
+	defer func() {
+		reviewDetach = false
+		reviewWait = false
+		reviewCode = false
+	}()
+
+	err := runCodeReview()
+
+	// --wait should have been ignored, so we should NOT get a tmux error.
+	// The test environment will produce some other error (TUI/git), but
+	// the key assertion is that we never entered the tmux detach path.
+	if err != nil && strings.Contains(err.Error(), "tmux") {
+		t.Errorf("--wait without --detach should not enter tmux path, got: %s", err)
+	}
+
+	// The flag should have been reset to false
+	if reviewWait {
+		t.Error("expected reviewWait to be reset to false")
+	}
+}
+
+// stubExecDeps replaces lookPath, resolveExec, and runCommand with test
+// doubles that avoid shelling out. It returns a pointer to a slice that
+// accumulates the args of every command passed to runCommand, and a cleanup
+// function that restores the originals.
+func stubExecDeps(t *testing.T) (*[][]string, func()) {
+	t.Helper()
+
+	origRun := runCommand
+	origLook := lookPath
+	origResolve := resolveExec
+
+	var commands [][]string
+
+	lookPath = func(name string) (string, error) {
+		return "/usr/bin/" + name, nil
+	}
+	resolveExec = func() (string, error) {
+		return "/usr/local/bin/crit", nil
+	}
+	runCommand = func(cmd *exec.Cmd) error {
+		commands = append(commands, cmd.Args)
+		return nil
+	}
+
+	return &commands, func() {
+		runCommand = origRun
+		lookPath = origLook
+		resolveExec = origResolve
+	}
+}
+
+// TestDetachedCodeReviewWaitCallsWaitFor verifies that --detach --wait --code
+// runs both the split-window command and the wait-for command.
+func TestDetachedCodeReviewWaitCallsWaitFor(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	commands, cleanup := stubExecDeps(t)
+	defer cleanup()
+
+	reviewDetach = true
+	reviewWait = true
+	reviewCode = true
+	defer func() {
+		reviewDetach = false
+		reviewWait = false
+		reviewCode = false
+	}()
+
+	err := runCodeReview()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if len(*commands) != 2 {
+		t.Fatalf("expected 2 commands (split-window + wait-for), got %d: %v", len(*commands), *commands)
+	}
+
+	split := (*commands)[0]
+	if !containsArg(split, "split-window") {
+		t.Errorf("first command should be split-window, got: %v", split)
+	}
+
+	wait := (*commands)[1]
+	if !containsArg(wait, "wait-for") {
+		t.Errorf("second command should be wait-for, got: %v", wait)
+	}
+}
+
+// TestDetachedCodeReviewNoWaitSkipsWaitFor verifies that --detach without
+// --wait only runs the split-window command and does NOT call wait-for.
+func TestDetachedCodeReviewNoWaitSkipsWaitFor(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	commands, cleanup := stubExecDeps(t)
+	defer cleanup()
+
+	reviewDetach = true
+	reviewWait = false
+	reviewCode = true
+	defer func() {
+		reviewDetach = false
+		reviewCode = false
+	}()
+
+	err := runCodeReview()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if len(*commands) != 1 {
+		t.Fatalf("expected 1 command (split-window only), got %d: %v", len(*commands), *commands)
+	}
+
+	if !containsArg((*commands)[0], "split-window") {
+		t.Errorf("expected split-window command, got: %v", (*commands)[0])
+	}
+}
+
+// TestDetachedReviewWaitCallsWaitFor verifies the single-file --detach --wait
+// path runs both split-window and wait-for.
+func TestDetachedReviewWaitCallsWaitFor(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	commands, cleanup := stubExecDeps(t)
+	defer cleanup()
+
+	reviewWait = true
+	defer func() { reviewWait = false }()
+
+	tmp, err := os.CreateTemp("", "crit-test-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Close()
+
+	err = runDetachedReview(tmp.Name())
+	// The wait path tries to Load() the review state file, which won't exist.
+	// That's fine — we just care that wait-for was called before that error.
+	if err != nil && !strings.Contains(err.Error(), "reading review state") {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if len(*commands) != 2 {
+		t.Fatalf("expected 2 commands (split-window + wait-for), got %d: %v", len(*commands), *commands)
+	}
+
+	if !containsArg((*commands)[1], "wait-for") {
+		t.Errorf("second command should be wait-for, got: %v", (*commands)[1])
+	}
+}
+
+func containsArg(args []string, target string) bool {
+	for _, a := range args {
+		if a == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPathResolution(t *testing.T) {

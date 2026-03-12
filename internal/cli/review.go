@@ -20,6 +20,18 @@ var reviewDetach bool
 var reviewWait bool
 var reviewCode bool
 
+// The following function variables allow tests to replace shell interactions
+// without actually shelling out.
+var runCommand = func(cmd *exec.Cmd) error {
+	return cmd.Run()
+}
+
+var lookPath = exec.LookPath
+
+var resolveExec = func() (string, error) {
+	return resolveExecutable()
+}
+
 var reviewCmd = &cobra.Command{
 	Use:   "review [file]",
 	Short: "Launch interactive TUI review",
@@ -125,12 +137,12 @@ func runDetachedCodeReview() error {
 		return fmt.Errorf("--detach requires a tmux session (TMUX environment variable not set)")
 	}
 
-	tmuxBin, err := exec.LookPath("tmux")
+	tmuxBin, err := lookPath("tmux")
 	if err != nil {
 		return fmt.Errorf("tmux binary not found on PATH: %w", err)
 	}
 
-	critBin, err := resolveExecutable()
+	critBin, err := resolveExec()
 	if err != nil {
 		return fmt.Errorf("resolving crit binary path: %w", err)
 	}
@@ -140,7 +152,7 @@ func runDetachedCodeReview() error {
 		shellEscape(critBin), channel)
 
 	splitCmd := exec.Command(tmuxBin, "split-window", "-h", "-p", "70", critCmd)
-	if err := splitCmd.Run(); err != nil {
+	if err := runCommand(splitCmd); err != nil {
 		return fmt.Errorf("failed to open tmux pane: %w", err)
 	}
 
@@ -148,7 +160,7 @@ func runDetachedCodeReview() error {
 
 	if reviewWait {
 		waitCmd := exec.Command(tmuxBin, "wait-for", channel)
-		if err := waitCmd.Run(); err != nil {
+		if err := runCommand(waitCmd); err != nil {
 			return fmt.Errorf("review pane terminated abnormally")
 		}
 
@@ -187,7 +199,7 @@ func runDetachedReview(filePath string) error {
 		return fmt.Errorf("--detach requires a tmux session (TMUX environment variable not set)")
 	}
 
-	tmuxBin, err := exec.LookPath("tmux")
+	tmuxBin, err := lookPath("tmux")
 	if err != nil {
 		return fmt.Errorf("tmux binary not found on PATH: %w", err)
 	}
@@ -197,7 +209,7 @@ func runDetachedReview(filePath string) error {
 		return fmt.Errorf("resolving absolute path: %w", err)
 	}
 
-	critBin, err := resolveExecutable()
+	critBin, err := resolveExec()
 	if err != nil {
 		return fmt.Errorf("resolving crit binary path: %w", err)
 	}
@@ -206,7 +218,7 @@ func runDetachedReview(filePath string) error {
 	critCmd := buildTmuxPaneCommand(critBin, absPath, channel)
 
 	splitCmd := exec.Command(tmuxBin, "split-window", "-h", "-p", "70", critCmd)
-	if err := splitCmd.Run(); err != nil {
+	if err := runCommand(splitCmd); err != nil {
 		return fmt.Errorf("failed to open tmux pane: %w", err)
 	}
 
@@ -214,7 +226,7 @@ func runDetachedReview(filePath string) error {
 
 	if reviewWait {
 		waitCmd := exec.Command(tmuxBin, "wait-for", channel)
-		if err := waitCmd.Run(); err != nil {
+		if err := runCommand(waitCmd); err != nil {
 			return fmt.Errorf("review pane terminated abnormally")
 		}
 
