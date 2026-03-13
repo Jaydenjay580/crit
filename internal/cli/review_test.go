@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -288,6 +289,124 @@ func TestDetachedReviewWaitCallsWaitFor(t *testing.T) {
 
 	if !containsArg((*commands)[1], "wait-for") {
 		t.Errorf("second command should be wait-for, got: %v", (*commands)[1])
+	}
+}
+
+// TestDetachedCodeReviewFallsBackWithoutPercentage verifies that when the
+// initial split-window with -p 70 fails, it retries without the percentage flag.
+func TestDetachedCodeReviewFallsBackWithoutPercentage(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	origRun := runCommand
+	origLook := lookPath
+	origResolve := resolveExec
+	defer func() {
+		runCommand = origRun
+		lookPath = origLook
+		resolveExec = origResolve
+	}()
+
+	var commands [][]string
+	lookPath = func(name string) (string, error) {
+		return "/usr/bin/" + name, nil
+	}
+	resolveExec = func() (string, error) {
+		return "/usr/local/bin/crit", nil
+	}
+	runCommand = func(cmd *exec.Cmd) error {
+		commands = append(commands, cmd.Args)
+		// Fail if -p is present (simulating the tmux percentage error)
+		if containsArg(cmd.Args, "-p") {
+			return fmt.Errorf("exit status 1")
+		}
+		return nil
+	}
+
+	reviewDetach = true
+	reviewWait = false
+	reviewCode = true
+	defer func() {
+		reviewDetach = false
+		reviewCode = false
+	}()
+
+	err := runCodeReview()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if len(commands) != 2 {
+		t.Fatalf("expected 2 commands (failed split + retry), got %d: %v", len(commands), commands)
+	}
+
+	// First attempt should have -p 70
+	if !containsArg(commands[0], "-p") {
+		t.Errorf("first attempt should include -p, got: %v", commands[0])
+	}
+
+	// Retry should NOT have -p
+	if containsArg(commands[1], "-p") {
+		t.Errorf("retry should not include -p, got: %v", commands[1])
+	}
+}
+
+// TestDetachedReviewFallsBackWithoutPercentage verifies the same fallback
+// behavior for single-file review mode.
+func TestDetachedReviewFallsBackWithoutPercentage(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	origRun := runCommand
+	origLook := lookPath
+	origResolve := resolveExec
+	defer func() {
+		runCommand = origRun
+		lookPath = origLook
+		resolveExec = origResolve
+	}()
+
+	var commands [][]string
+	lookPath = func(name string) (string, error) {
+		return "/usr/bin/" + name, nil
+	}
+	resolveExec = func() (string, error) {
+		return "/usr/local/bin/crit", nil
+	}
+	runCommand = func(cmd *exec.Cmd) error {
+		commands = append(commands, cmd.Args)
+		if containsArg(cmd.Args, "-p") {
+			return fmt.Errorf("exit status 1")
+		}
+		return nil
+	}
+
+	reviewWait = false
+	defer func() { reviewWait = false }()
+
+	tmp, err := os.CreateTemp("", "crit-test-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Close()
+
+	err = runDetachedReview(tmp.Name())
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if len(commands) != 2 {
+		t.Fatalf("expected 2 commands (failed split + retry), got %d: %v", len(commands), commands)
+	}
+
+	if !containsArg(commands[0], "-p") {
+		t.Errorf("first attempt should include -p, got: %v", commands[0])
+	}
+	if containsArg(commands[1], "-p") {
+		t.Errorf("retry should not include -p, got: %v", commands[1])
 	}
 }
 

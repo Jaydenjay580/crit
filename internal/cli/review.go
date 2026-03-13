@@ -153,7 +153,12 @@ func runDetachedCodeReview() error {
 
 	splitCmd := exec.Command(tmuxBin, "split-window", "-h", "-p", "70", critCmd)
 	if err := runCommand(splitCmd); err != nil {
-		return fmt.Errorf("failed to open tmux pane: %w", err)
+		// Retry without -p flag — percentage sizing fails when parent pane
+		// size isn't available (e.g. invoked from a subprocess like Claude Code)
+		splitCmd = exec.Command(tmuxBin, "split-window", "-h", critCmd)
+		if err := runCommand(splitCmd); err != nil {
+			return fmt.Errorf("failed to open tmux pane: %w", err)
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "Opened code review in tmux pane")
@@ -219,7 +224,12 @@ func runDetachedReview(filePath string) error {
 
 	splitCmd := exec.Command(tmuxBin, "split-window", "-h", "-p", "70", critCmd)
 	if err := runCommand(splitCmd); err != nil {
-		return fmt.Errorf("failed to open tmux pane: %w", err)
+		// Retry without -p flag — percentage sizing fails when parent pane
+		// size isn't available (e.g. invoked from a subprocess like Claude Code)
+		splitCmd = exec.Command(tmuxBin, "split-window", "-h", critCmd)
+		if err := runCommand(splitCmd); err != nil {
+			return fmt.Errorf("failed to open tmux pane: %w", err)
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "Opened review in tmux pane")
