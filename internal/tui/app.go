@@ -187,7 +187,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case docRenderedMsg:
-		// Load documents and initialize fresh review state for each tab
+		// Load documents and existing review state for each tab
 		for i := range m.tabs {
 			t := &m.tabs[i]
 			if t.isBinary || t.isDeleted {
@@ -199,10 +199,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			doc, _ := document.Load(t.path)
 			t.doc = doc
-			t.state = &review.ReviewState{
-				File:     t.path,
-				Comments: []review.Comment{},
+			// Load existing review state (returns empty state if none exists)
+			state, err := review.Load(t.path)
+			if err != nil {
+				state = &review.ReviewState{
+					File:     t.path,
+					Comments: []review.Comment{},
+				}
 			}
+			t.state = state
 			t.ensureHighlightCache()
 		}
 
