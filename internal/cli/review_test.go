@@ -419,6 +419,76 @@ func containsArg(args []string, target string) bool {
 	return false
 }
 
+// TestDetachedCodeReviewPassesBaseFlag verifies that --base is forwarded
+// to the child crit process in the tmux split command.
+func TestDetachedCodeReviewPassesBaseFlag(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	commands, cleanup := stubExecDeps(t)
+	defer cleanup()
+
+	reviewDetach = true
+	reviewWait = false
+	reviewCode = true
+	reviewBase = "abc123"
+	defer func() {
+		reviewDetach = false
+		reviewCode = false
+		reviewBase = ""
+	}()
+
+	err := runCodeReview()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if len(*commands) != 1 {
+		t.Fatalf("expected 1 command, got %d: %v", len(*commands), *commands)
+	}
+
+	// The last arg to split-window is the shell command string
+	shellCmd := (*commands)[0][len((*commands)[0])-1]
+	if !strings.Contains(shellCmd, "--base 'abc123'") {
+		t.Errorf("expected --base flag in tmux command, got: %s", shellCmd)
+	}
+}
+
+// TestDetachedCodeReviewOmitsBaseFlagWhenEmpty verifies that --base is NOT
+// included in the tmux command when reviewBase is empty.
+func TestDetachedCodeReviewOmitsBaseFlagWhenEmpty(t *testing.T) {
+	origTmux := os.Getenv("TMUX")
+	os.Setenv("TMUX", "/tmp/tmux-test/default,12345,0")
+	defer os.Setenv("TMUX", origTmux)
+
+	commands, cleanup := stubExecDeps(t)
+	defer cleanup()
+
+	reviewDetach = true
+	reviewWait = false
+	reviewCode = true
+	reviewBase = ""
+	defer func() {
+		reviewDetach = false
+		reviewCode = false
+	}()
+
+	err := runCodeReview()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if len(*commands) != 1 {
+		t.Fatalf("expected 1 command, got %d: %v", len(*commands), *commands)
+	}
+
+	shellCmd := (*commands)[0][len((*commands)[0])-1]
+	if strings.Contains(shellCmd, "--base") {
+		t.Errorf("expected no --base flag in tmux command, got: %s", shellCmd)
+	}
+}
+
 func TestPathResolution(t *testing.T) {
 	rel := "relative/path/doc.md"
 	abs, err := filepath.Abs(rel)

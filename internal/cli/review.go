@@ -19,6 +19,7 @@ import (
 var reviewDetach bool
 var reviewWait bool
 var reviewCode bool
+var reviewBase string
 
 // The following function variables allow tests to replace shell interactions
 // without actually shelling out.
@@ -76,6 +77,7 @@ func init() {
 	reviewCmd.Flags().BoolVar(&reviewDetach, "detach", false, "open review in a tmux split pane")
 	reviewCmd.Flags().BoolVar(&reviewWait, "wait", false, "block until the detached review completes (requires --detach)")
 	reviewCmd.Flags().BoolVar(&reviewCode, "code", false, "review code changes (multi-file mode)")
+	reviewCmd.Flags().StringVar(&reviewBase, "base", "", "base commit to diff against (used with --code)")
 }
 
 func runCodeReview() error {
@@ -93,19 +95,32 @@ func runCodeReview() error {
 		return fmt.Errorf("crit review --code requires a git repository")
 	}
 
-	files, err := git.ChangedFiles()
-	if err != nil {
-		return fmt.Errorf("detecting changed files: %w", err)
-	}
+	var ref string
+	var files []git.FileChange
+	var err error
 
-	ref := "HEAD"
-
-	if len(files) == 0 {
-		// Interactive fallback: try other refs
-		var fallbackErr error
-		ref, files, fallbackErr = interactiveFallback()
-		if fallbackErr != nil {
-			return fallbackErr
+	if reviewBase != "" {
+		ref = reviewBase
+		files, err = git.ChangedFilesFrom(ref)
+		if err != nil {
+			return fmt.Errorf("detecting changed files from %s: %w", ref, err)
+		}
+		if len(files) == 0 {
+			return fmt.Errorf("no changed files found relative to %s", ref)
+		}
+	} else {
+		ref = "HEAD"
+		files, err = git.ChangedFiles()
+		if err != nil {
+			return fmt.Errorf("detecting changed files: %w", err)
+		}
+		if len(files) == 0 {
+			// Interactive fallback: try other refs
+			var fallbackErr error
+			ref, files, fallbackErr = interactiveFallback()
+			if fallbackErr != nil {
+				return fallbackErr
+			}
 		}
 	}
 
@@ -148,8 +163,12 @@ func runDetachedCodeReview() error {
 	}
 
 	channel := fmt.Sprintf("crit-review-%d", os.Getpid())
-	critCmd := fmt.Sprintf("CRIT_DETACHED=1 %s review --code ; tmux wait-for -S %s",
-		shellEscape(critBin), channel)
+	baseFlag := ""
+	if reviewBase != "" {
+		baseFlag = " --base " + shellEscape(reviewBase)
+	}
+	critCmd := fmt.Sprintf("CRIT_DETACHED=1 %s review --code%s ; tmux wait-for -S %s",
+		shellEscape(critBin), baseFlag, channel)
 
 	splitCmd := exec.Command(tmuxBin, "split-window", "-h", "-p", "70", critCmd)
 	if err := runCommand(splitCmd); err != nil {
